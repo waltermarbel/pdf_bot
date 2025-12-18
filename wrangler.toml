@@ -3,8 +3,20 @@ main = "src/entry.py"
 compatibility_date = "2024-04-01"
 
 [vars]
-# Placeholder variables (Set real values via `wrangler secret put`)
 # SUPABASE_URL = ""
 # SUPABASE_KEY = ""
 # PDFOTTER_API_KEY = ""
 # PDFOTTER_TEMPLATE_ID = ""
+# GPT_AUTH_TOKEN = ""
+
+# R2 Configuration Variables
+# R2_ACCOUNT_ID = ""
+# R2_ACCESS_KEY_ID = ""
+# R2_SECRET_ACCESS_KEY = ""
+# R2_BUCKET_NAME = ""
+# R2_PUBLIC_URL_BASE = "" # Optional custom domain
+
+# Binding to an R2 Bucket (if using Cloudflare bindings instead of S3 SDK)
+# [[r2_buckets]]
+# binding = "CLAIMS_BUCKET"
+# bucket_name = "your-bucket-name"

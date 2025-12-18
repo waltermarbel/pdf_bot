@@ -1,13 +1,14 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional
 import os
 import json
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, date
-import re
 from urllib.parse import urljoin, urlparse
+import boto3
+from botocore.config import Config
 
 app = FastAPI()
 
@@ -16,6 +17,15 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PDFOTTER_API_KEY = os.environ.get("PDFOTTER_API_KEY")
 PDFOTTER_TEMPLATE_ID = os.environ.get("PDFOTTER_TEMPLATE_ID")
+GPT_AUTH_TOKEN = os.environ.get("GPT_AUTH_TOKEN")
+
+# R2 Configuration
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+# Optional: Custom domain for R2 (e.g., https://files.mydomain.com)
+R2_PUBLIC_URL_BASE = os.environ.get("R2_PUBLIC_URL_BASE")
 
 # --- Constants ---
 SCRAPE_HEADERS = {
@@ -31,7 +41,15 @@ class ClaimRequest(BaseModel):
 
 class SyncRequest(BaseModel):
     scanlily_url: str
-    limit: Optional[int] = 10 # Safety limit to prevent Worker timeouts
+    limit: Optional[int] = 10
+
+# --- Security ---
+async def verify_token(x_auth_token: str = Header(...)):
+    """
+    Verifies the API Key sent by the GPT/Client.
+    """
+    if x_auth_token != GPT_AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid Auth Token")
 
 # --- Helpers ---
 def supabase_request(method, endpoint, data=None, params=None):
@@ -42,7 +60,6 @@ def supabase_request(method, endpoint, data=None, params=None):
         "Content-Type": "application/json",
         "Prefer": "return=representation"
     }
-    # "Prefer: resolution=merge-duplicates" is crucial for Upserts (INSERT ON CONFLICT UPDATE)
     if method == "POST" and endpoint == "inventory_items":
         headers["Prefer"] = "resolution=merge-duplicates"
 
@@ -60,6 +77,42 @@ def supabase_request(method, endpoint, data=None, params=None):
         print(f"Supabase Error: {e}")
         return None
 
+def upload_to_r2(file_content: bytes, file_name: str, content_type: str = "application/pdf") -> str:
+    """
+    Uploads bytes to Cloudflare R2 and returns the public URL.
+    """
+    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
+        print("R2 credentials missing. Skipping upload.")
+        return None
+
+    try:
+        s3 = boto3.client(
+            's3',
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version='s3v4')
+        )
+
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=file_name,
+            Body=file_content,
+            ContentType=content_type
+        )
+
+        # Construct URL
+        if R2_PUBLIC_URL_BASE:
+            return f"{R2_PUBLIC_URL_BASE}/{file_name}"
+        else:
+            # Fallback: Presigned URL or standard R2 dev URL logic (often cleaner to use custom domain)
+            # For now returning the key, user assumes public bucket access pattern
+            return f"https://{R2_BUCKET_NAME}.r2.dev/{file_name}" # Example standard dev domain
+
+    except Exception as e:
+        print(f"R2 Upload Error: {e}")
+        return None
+
 def calculate_failure_date(filing_date_str: Optional[str]) -> str:
     try:
         dt = date.fromisoformat(filing_date_str) if filing_date_str else date.today()
@@ -69,11 +122,7 @@ def calculate_failure_date(filing_date_str: Optional[str]) -> str:
         return date.today().strftime("%m/%d/%Y")
 
 # --- Scraping Logic ---
-
 def scrape_item_details(item_url: str):
-    """
-    Visits a specific item page and extracts detailed metadata.
-    """
     details = {}
     try:
         resp = requests.get(item_url, headers=SCRAPE_HEADERS, timeout=10)
@@ -81,23 +130,17 @@ def scrape_item_details(item_url: str):
         soup = BeautifulSoup(resp.text, 'html.parser')
         container = soup.find('div', class_='container')
 
-        if not container:
-            return None
+        if not container: return None
 
-        # 1. Basic Info
         title_tag = container.find('h1', class_='text-2xl')
         details['device_name'] = title_tag.text.strip() if title_tag else "Unknown Device"
 
         cat_tag = container.find('p', class_='text-gray-600', string=lambda t: t and 'Category:' in t)
         details['category'] = cat_tag.text.replace('Category:', '').strip() if cat_tag else "Other"
 
-        # 2. Specs (Serial, Brand, Flag)
-        # Mapping ScanLily labels to DB columns
         key_map = {
-             "brand": "brand",
-             "model number": "model",
-             "serial number": "serial_number",
-             "flag": "scanlily_flag",
+             "brand": "brand", "model number": "model",
+             "serial number": "serial_number", "flag": "scanlily_flag",
              "equipment status": "equipment_status"
         }
 
@@ -108,64 +151,37 @@ def scrape_item_details(item_url: str):
                 for item in specs_div.find_all('div', class_='flex'):
                     label_span = item.find('span', class_=['font-medium', 'w-32', 'text-gray-700'])
                     value_span = item.find('span', class_='text-gray-800')
-
                     if label_span and value_span:
                         raw_key = label_span.text.strip().rstrip(':').lower()
                         if raw_key in key_map:
                             details[key_map[raw_key]] = value_span.text.strip()
-
         return details
     except Exception as e:
         print(f"Error scraping item {item_url}: {e}")
         return None
 
 def sync_inventory_process(main_url: str, limit: int = 10):
-    """
-    Iterates through the main inventory grid, scrapes details, upserts to DB.
-    """
     results = {"scanned": 0, "updated": 0, "errors": []}
-
     try:
-        # 1. Fetch Main Page
         resp = requests.get(main_url, headers=SCRAPE_HEADERS, timeout=15)
         soup = BeautifulSoup(resp.text, 'html.parser')
-
-        # 2. Parse URL structure
         parsed_url = urlparse(main_url)
         base_url = f"{parsed_url.scheme}://{parsed_url.netloc}/"
-
-        # 3. Find Items
         product_divs = soup.find_all('div', attrs={'data-item-id': True})
 
-        # 4. Loop and Scrape (Respecting limit)
         for i, div in enumerate(product_divs):
-            if i >= limit:
-                break
+            if i >= limit: break
 
             item_id = div.get('data-item-id')
-            # Construct item URL (ScanLily structure usually /product/{id})
-            # Adjust path finding based on your specific URL structure if needed
-            # For now assuming standard path relative to root
-            # "inventory/..." -> "inventory/.../product/..."
-
-            # Simple heuristic: Look for the link inside the div
             link_tag = div.find('a', href=True)
-            if link_tag:
-                full_item_url = urljoin(base_url, link_tag['href'])
-            else:
-                # Fallback construction
-                full_item_url = urljoin(main_url, f"product/{item_id}")
+            full_item_url = urljoin(base_url, link_tag['href']) if link_tag else urljoin(main_url, f"product/{item_id}")
 
-            # 5. Deep Scrape
             details = scrape_item_details(full_item_url)
-
             if details:
-                # 6. Prepare DB Payload
                 db_item = {
                     "item_id": item_id,
                     "scanlily_url": full_item_url,
                     "last_scanned_at": datetime.now().isoformat(),
-                    # Merged details
                     "device_name": details.get("device_name"),
                     "category": details.get("category"),
                     "brand": details.get("brand"),
@@ -174,114 +190,93 @@ def sync_inventory_process(main_url: str, limit: int = 10):
                     "scanlily_flag": details.get("scanlily_flag", "neutral"),
                     "equipment_status": details.get("equipment_status")
                 }
-
-                # 7. Upsert to Supabase
-                res = supabase_request("POST", "inventory_items", db_item)
-                if res:
+                if supabase_request("POST", "inventory_items", db_item):
                     results["updated"] += 1
                 else:
                     results["errors"].append(f"Failed DB save for {item_id}")
-
             results["scanned"] += 1
-
     except Exception as e:
         results["errors"].append(str(e))
-
     return results
 
 # --- Endpoints ---
 
 @app.get("/")
 def home():
-    return {"status": "ScanLily Auto-Filer Active", "version": "2.0"}
+    return {"status": "ScanLily Auto-Filer Active", "version": "3.0 (Secured + R2)"}
 
-@app.post("/inventory/sync")
+@app.post("/inventory/sync", dependencies=[Depends(verify_token)])
 def trigger_sync(req: SyncRequest):
-    """
-    Action: "Sync Inventory".
-    Scrapes ScanLily and updates Supabase.
-    """
-    result = sync_inventory_process(req.scanlily_url, req.limit)
-    return result
+    return sync_inventory_process(req.scanlily_url, req.limit)
 
-@app.post("/claims/generate-pdf")
+@app.post("/claims/generate-pdf", dependencies=[Depends(verify_token)])
 def generate_pdf(req: ClaimRequest):
-    """
-    Action: "Generate PDF".
-    Returns the direct PDFOtter download link.
-    """
-    # 1. Fetch Item & Account from DB
+    # 1. Fetch Data
     items = supabase_request("GET", "inventory_items", params={"item_id": f"eq.{req.item_id}"})
     accounts = supabase_request("GET", "account_holders", params={"profile_id": f"eq.{req.profile_id}"})
 
     if not items or not accounts:
-        raise HTTPException(status_code=404, detail="Item or Account not found in Database. Did you sync?")
-
-    item = items[0]
-    account = accounts[0]
+        raise HTTPException(status_code=404, detail="Item or Account not found.")
+    item, account = items[0], accounts[0]
 
     # 2. Dates
     fail_date = calculate_failure_date(req.filing_date)
-    # If filing_date provided, use it. Otherwise today.
     sign_date = date.fromisoformat(req.filing_date).strftime("%m/%d/%Y") if req.filing_date else date.today().strftime("%m/%d/%Y")
 
-    # 3. Payload Construction
+    # 3. PDF Payload
     payload = {
         "data": {
-            "First name": account.get("first_name"),
-            "Last name": account.get("last_name"),
-            "Address": account.get("address"),
-            "City": account.get("city"),
-            "State": account.get("state"),
-            "ZIP Code": account.get("zip_code"),
-            "Phone": account.get("phone"),
-            "Email": account.get("email"),
-            "Brand": item.get("brand", "N/A"),
-            "Model number": item.get("model", "N/A"),
-            "Serial number": item.get("serial_number", "N/A"),
-            "Claim ID": f"{req.item_id}",
-            "Describe what happened": req.description,
-            "Date of failure MM/DD/YYYY": fail_date,
-            "Date MM/DD/YYYY": sign_date,
-            "Signature of enrolled account holder": account.get("signature_base64")
+            "First name": account.get("first_name"), "Last name": account.get("last_name"),
+            "Address": account.get("address"), "City": account.get("city"), "State": account.get("state"),
+            "ZIP Code": account.get("zip_code"), "Phone": account.get("phone"), "Email": account.get("email"),
+            "Brand": item.get("brand", "N/A"), "Model number": item.get("model", "N/A"),
+            "Serial number": item.get("serial_number", "N/A"), "Claim ID": f"{req.item_id}",
+            "Describe what happened": req.description, "Date of failure MM/DD/YYYY": fail_date,
+            "Date MM/DD/YYYY": sign_date, "Signature of enrolled account holder": account.get("signature_base64")
         },
-        "output": {
-            "file_name": f"Claim_{req.item_id}.pdf"
-        }
+        "output": { "file_name": f"Claim_{req.item_id}.pdf" }
     }
 
-    # 4. Call PDF Otter
+    # 4. Generate PDF
     try:
         otter_resp = requests.post(
             f"https://www.pdfotter.com/api/v1/pdf_templates/{PDFOTTER_TEMPLATE_ID}/fill",
-            auth=(PDFOTTER_API_KEY, ""),
-            json=payload,
-            timeout=30
+            auth=(PDFOTTER_API_KEY, ""), json=payload, timeout=30
         )
 
         if otter_resp.status_code == 200:
             data = otter_resp.json()
-            # PDFOtter v1 usually returns 'url' or 'output_url' in the response JSON
             pdf_link = data.get("url") or data.get("output_url")
 
-            if not pdf_link:
-                # Fallback if API changes: Just return success, but usually URL is there
-                return {"status": "success", "message": "PDF generated, but no link returned.", "debug": data}
+            final_pdf_url = pdf_link # Default to PDFOtter link
 
-            # 5. Log to Claims Table
+            # 5. R2 Archiving (Enhanced Feature)
+            if pdf_link and R2_BUCKET_NAME:
+                print("Archiving to R2...")
+                try:
+                    pdf_bytes = requests.get(pdf_link).content
+                    r2_filename = f"claims/Claim_{req.item_id}_{datetime.now().strftime('%Y%m%d')}.pdf"
+                    r2_url = upload_to_r2(pdf_bytes, r2_filename)
+                    if r2_url:
+                        final_pdf_url = r2_url
+                        print(f"Archived successfully: {final_pdf_url}")
+                except Exception as archive_err:
+                    print(f"R2 Archival Failed: {archive_err}")
+                    # Fallback to PDFOtter link if archival fails
+
+            # 6. Log to DB
             supabase_request("POST", "claims", {
                 "item_id": req.item_id,
                 "profile_id": req.profile_id,
                 "status": "generated",
                 "description": req.description,
-                "pdf_url": pdf_link
+                "pdf_url": final_pdf_url
             })
 
             return {
                 "status": "success",
-                "message": "PDF Generated Successfully",
-                "download_url": pdf_link,
-                "note": "Link expires based on PDFOtter retention policy."
+                "message": "PDF Generated",
+                "download_url": final_pdf_url
             }
         else:
             raise HTTPException(status_code=500, detail=f"PDF Otter failed: {otter_resp.text}")
