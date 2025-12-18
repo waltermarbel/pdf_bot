@@ -36,6 +36,7 @@ SCRAPE_HEADERS = {
 class ClaimRequest(BaseModel):
     item_id: str
     profile_id: str
+    provider_claim_id: str # Required: External ID from Insurance Provider
     description: str = "Device stopped working unexpectedly."
     filing_date: Optional[str] = None # YYYY-MM-DD
 
@@ -230,7 +231,7 @@ def generate_pdf(req: ClaimRequest):
             "Address": account.get("address"), "City": account.get("city"), "State": account.get("state"),
             "ZIP Code": account.get("zip_code"), "Phone": account.get("phone"), "Email": account.get("email"),
             "Brand": item.get("brand", "N/A"), "Model number": item.get("model", "N/A"),
-            "Serial number": item.get("serial_number", "N/A"), "Claim ID": f"{req.item_id}",
+            "Serial number": item.get("serial_number", "N/A"), "Claim ID": req.provider_claim_id,
             "Describe what happened": req.description, "Date of failure MM/DD/YYYY": fail_date,
             "Date MM/DD/YYYY": sign_date, "Signature of enrolled account holder": account.get("signature_base64")
         },
@@ -268,6 +269,7 @@ def generate_pdf(req: ClaimRequest):
             supabase_request("POST", "claims", {
                 "item_id": req.item_id,
                 "profile_id": req.profile_id,
+                "provider_claim_id": req.provider_claim_id,
                 "status": "generated",
                 "description": req.description,
                 "pdf_url": final_pdf_url
